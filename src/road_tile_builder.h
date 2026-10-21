@@ -1,11 +1,12 @@
 #pragma once
 // Portable streaming Overpass -> existing little-endian road-tile geometry.
-// One way is held at a time; the response and tile are never accumulated in RAM.
+// One way is held at a time; JSON is decoded one coordinate object at a time.
 #include <ArduinoJson.h>
 #include <cstddef>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 
 namespace road_tile_builder {
 class BoundedAllocator : public ArduinoJson::Allocator {
@@ -37,6 +38,44 @@ public:
         if (!p) return nullptr;
         held_ = held_ - old + n; if (held_ > peak_) peak_ = held_;
         p->size = n; return p + 1;
+    }
+};
+// ArduinoJson creates a short-lived string buffer per deserializeJson() call.
+// Retain one small block across coordinates; the upstream budget still accounts
+// for its full capacity. Larger/overlapping allocations use the normal allocator.
+class RecyclingAllocator : public ArduinoJson::Allocator {
+    static constexpr size_t CAPACITY = 128;
+    ArduinoJson::Allocator *upstream_;
+    void *small_ = nullptr;
+    bool busy_ = false;
+    void *alloc(size_t n) { return upstream_ ? upstream_->allocate(n) : std::malloc(n); }
+    void release(void *p) { if (upstream_) upstream_->deallocate(p); else std::free(p); }
+public:
+    explicit RecyclingAllocator(ArduinoJson::Allocator *upstream) : upstream_(upstream) {}
+    RecyclingAllocator(const RecyclingAllocator &) = delete;
+    RecyclingAllocator &operator=(const RecyclingAllocator &) = delete;
+    ~RecyclingAllocator() { if (small_) release(small_); }
+    void *allocate(size_t n) override {
+        if (n <= CAPACITY && !busy_) {
+            if (!small_) small_ = alloc(CAPACITY);
+            if (small_) { busy_ = true; return small_; }
+        }
+        return alloc(n);
+    }
+    void deallocate(void *p) override {
+        if (!p) return;
+        if (p == small_) busy_ = false;
+        else release(p);
+    }
+    void *reallocate(void *p, size_t n) override {
+        if (!p) return allocate(n);
+        if (p == small_) {
+            if (n <= CAPACITY) return p;
+            void *larger = alloc(n);
+            if (larger) { std::memcpy(larger, p, CAPACITY); busy_ = false; }
+            return larger;
+        }
+        return upstream_ ? upstream_->reallocate(p, n) : std::realloc(p, n);
     }
 };
 constexpr unsigned MAX_POINTS = 2048;
@@ -98,6 +137,16 @@ template<class Input> struct Reader {
     }
     int space() { int c; do { c = peek(); if (c == ' ' || c == '\r' || c == '\n' || c == '\t') read(); else return c; } while (true); }
     bool take(int c) { if (space() != c) return false; read(); return true; }
+    bool string(char *out, size_t capacity) {
+        if (!take('"')) return false;
+        size_t n = 0; int c;
+        while ((c = read()) != '"') {
+            if (c < 32 || c == '\\' || n + 1 >= capacity) return false;
+            out[n++] = (char)c;
+        }
+        out[n] = 0;
+        return true;
+    }
     // Skip metadata without retaining it. Strings and containers are bounded in depth;
     // the network reader independently bounds bytes and time.
     bool skip(unsigned depth = 0) {
@@ -128,54 +177,99 @@ template<class Input> struct Reader {
     }
 };
 
+inline const char *json_error(DeserializationError e) {
+    if (e == DeserializationError::NoMemory) return "road JSON: NoMemory";
+    if (e == DeserializationError::IncompleteInput) return "road JSON: IncompleteInput";
+    if (e == DeserializationError::EmptyInput) return "road JSON: EmptyInput";
+    if (e == DeserializationError::TooDeep) return "road JSON: TooDeep";
+    return "road JSON: InvalidInput";
+}
+
+template<class R>
+bool read_way(R &r, Scratch &s, JsonVariant point, const JsonDocument &filter,
+              unsigned &n, const char *&error) {
+    if (!r.take('{')) return false;
+    bool typeSeen = false, geometrySeen = false;
+    n = 0;
+    do {
+        char key[64];
+        if (!r.string(key, sizeof(key)) || !r.take(':')) return false;
+        if (!strcmp(key, "type")) {
+            char type[16];
+            if (typeSeen || !r.string(type, sizeof(type)) || strcmp(type, "way")) return false;
+            typeSeen = true;
+        } else if (!strcmp(key, "geometry")) {
+            if (geometrySeen || !r.take('[')) return false;
+            geometrySeen = true;
+            if (!r.take(']')) {
+                do {
+                    if (n == MAX_POINTS) { error = "road geometry exceeds point limit"; return false; }
+                    if (r.space() != '{') return false;
+                    // Decode just ONE lat/lon object, not the entire geometry array.
+                    // This keeps JSON memory constant even for a long road.
+                    const auto e = deserializeJson(point, r, DeserializationOption::Filter(filter),
+                                                   DeserializationOption::NestingLimit(16));
+                    if (e) { error = json_error(e); return false; }
+                    if (!point["lat"].is<double>() || !point["lon"].is<double>()) return false;
+                    const double lat = point["lat"], lon = point["lon"];
+                    if (!std::isfinite(lat) || !std::isfinite(lon) || lat < -90 || lat > 90 || lon < -180 || lon > 180) return false;
+                    s.points[n++] = {lat, lon};
+                } while (r.take(','));
+                if (!r.take(']')) return false;
+            }
+        } else if (!r.skip()) return false;
+        if (r.take('}')) return typeSeen && geometrySeen;
+    } while (r.take(','));
+    return false;
+}
+
 // Sink.line(int16 lat/lon pairs, point count) must consume/copy the data before returning.
 // Any error, including an Overpass 'remark' on an otherwise HTTP-200 response, rejects
 // the WHOLE tile. The caller publishes only after this function succeeds.
 template<class Input, class Sink>
 bool generate(Input &input, Sink &sink, Scratch &s, ArduinoJson::Allocator *allocator,
-              const char *&error) {
+              const char *&error, char *serverRemark = nullptr, size_t remarkCapacity = 0) {
     Reader<Input> r { input };
-    JsonDocument doc = allocator ? JsonDocument(allocator) : JsonDocument();
+    RecyclingAllocator reuse(allocator);
+    JsonDocument doc(&reuse);
+    // Deserialize into the root variant so coordinate-to-coordinate clearing
+    // reuses slots instead of releasing/reallocating the document's memory pool.
+    JsonVariant point = doc.to<JsonVariant>();
     JsonDocument filter;
-    filter["type"] = true;
-    filter["geometry"][0]["lat"] = true;
-    filter["geometry"][0]["lon"] = true;
+    filter["lat"] = true;
+    filter["lon"] = true;
     error = "invalid Overpass response";
     if (!r.take('{')) return false;
     bool found = false;
     unsigned polys = 0;
     do {
-        if (!r.take('"')) return false;
-        char key[64]; unsigned k = 0; int c;
-        while ((c = r.read()) != '"') {
-            if (c < 32 || c == '\\' || k >= sizeof(key)-1) return false;
-            key[k++] = (char)c;
-        }
-        key[k] = 0;
+        char key[64];
+        if (!r.string(key, sizeof(key))) return false;
         if (!r.take(':')) return false;
-        if (!strcmp(key, "remark")) { error = "Overpass reported an error"; return false; }
+        if (!strcmp(key, "remark")) {
+            error = "Overpass reported an error";
+            if (serverRemark && remarkCapacity > 1) {
+                const auto e = deserializeJson(doc, r, DeserializationOption::NestingLimit(2));
+                if (!e && doc.is<const char *>()) {
+                    const char *message = doc.as<const char *>();
+                    size_t i = 0;
+                    while (message[i] && i + 1 < remarkCapacity) {
+                        serverRemark[i] = (unsigned char)message[i] < 32 ? ' ' : message[i]; ++i;
+                    }
+                    serverRemark[i] = 0;
+                    if (i) error = serverRemark;
+                }
+            }
+            return false; // a successful HTTP status never makes a partial tile usable
+        }
         if (strcmp(key, "elements")) { if (!r.skip()) return false; }
         else {
             if (found || !r.take('[')) return false;
             found = true;
             if (!r.take(']')) {
                 do {
-                    if (r.space() != '{') return false;
-                    const auto e = deserializeJson(doc, r, DeserializationOption::Filter(filter),
-                                                   DeserializationOption::NestingLimit(16));
-                    if (e) { error = "road JSON exceeds memory limit or is incomplete"; return false; }
-                    if (strcmp(doc["type"] | "", "way")) return false;
-                    JsonArrayConst geometry = doc["geometry"].template as<JsonArrayConst>();
-                    if (geometry.isNull() || geometry.size() > MAX_POINTS) {
-                        error = "road geometry exceeds point limit"; return false;
-                    }
                     unsigned n = 0;
-                    for (JsonObjectConst p : geometry) {
-                        if (!p["lat"].is<double>() || !p["lon"].is<double>()) return false;
-                        const double lat = p["lat"], lon = p["lon"];
-                        if (!std::isfinite(lat) || !std::isfinite(lon) || lat < -90 || lat > 90 || lon < -180 || lon > 180) return false;
-                        s.points[n++] = {lat, lon};
-                    }
+                    if (!read_way(r, s, point, filter, n, error)) return false;
                     n = simplify(s, n);
                     if (n) {
                         if (++polys > MAX_POLYS) { error = "tile exceeds polyline limit"; return false; }

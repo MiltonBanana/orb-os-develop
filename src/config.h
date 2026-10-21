@@ -7,7 +7,7 @@
 // "1.4.2", said "up to date", and left an Orb missing everything in that list. THEME_CAPS
 // exists because this stopped moving; it covers theme settings and nothing else, so a new
 // command or a deleted screen is invisible to it. Move this too.
-#define FW_VERSION "2.18.05"   // shown on the web config page + Stats screen
+#define FW_VERSION "2.18.14"   // shown on the web config page + Stats screen
 
 // On-device road generation. Override for a private Overpass instance if needed.
 #ifndef ROAD_OVERPASS_URL

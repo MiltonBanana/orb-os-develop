@@ -63,12 +63,10 @@ void airports_draw(lv_draw_ctx_t *ctx, lv_color_t color, lv_opa_t opa) {
         lv_point_t bottom = { ap.pos.x, (lv_coord_t)(ap.pos.y + 12) };
         lv_draw_line(ctx, &crosshair, &left, &right);
         lv_draw_line(ctx, &crosshair, &top, &bottom);
-        if (ap.large) {
-            if (ap.iata[0]) {
-                lv_area_t la = { (lv_coord_t)(ap.pos.x + 16), (lv_coord_t)(ap.pos.y - 7),
-                                 (lv_coord_t)(ap.pos.x + 55), (lv_coord_t)(ap.pos.y + 7) };
-                lv_draw_label(ctx, &lbl, &la, ap.iata, NULL);
-            }
+        if (ap.iata[0]) {
+            lv_area_t la = { (lv_coord_t)(ap.pos.x + 16), (lv_coord_t)(ap.pos.y - 7),
+                             (lv_coord_t)(ap.pos.x + 55), (lv_coord_t)(ap.pos.y + 7) };
+            lv_draw_label(ctx, &lbl, &la, ap.iata, NULL);
         }
     }
 }

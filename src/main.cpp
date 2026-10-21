@@ -53,6 +53,7 @@
 #include "sdcard.h"                  // microSD (TF) slot, SPI mode
 #include "roads_sd.h"                // worldwide roads read off the SD card
 #include "roads_download.h"
+#include "road_preload.h"
 #include "clock_view.h"              // clock app (app two)
 #include "weather_view.h"           // animated weather-radar app (knob channel)
 #include "settings_view.h"          // settings app (menu; captures the knob)
@@ -1725,6 +1726,7 @@ static const char ROOT_TAIL[] PROGMEM =
     "</dl></div>"
     "<div class=card>"
     "<a class=b href='/install'>Install a theme file</a>"
+    "<a class=b href='/roads'>Preload road maps</a>"
     // Upstream 2.16.64 guarded this link: with no OTA partition the page it points at
     // 404s, so advertising it is a lie. Preserved here because this function moved into a
     // PROGMEM literal in the same release — string-literal concatenation takes a #if
@@ -3520,6 +3522,31 @@ void setup() {
         g_web.send(200, "application/json", b);
     });
     g_web.on("/sdput", HTTP_POST, handleSdPutDone, handleSdPutUpload);   // Launch Kit pushes theme files here
+    road_preload::begin(g_web);
+    g_web.on("/roads/locations.json", HTTP_GET, [] {
+        JsonDocument doc;
+        doc["rangeKm"] = g_settings.rangeKm;
+        doc["endpoint"] = ROAD_OVERPASS_URL;
+        doc["sdMounted"] = sdcard::mounted();
+        JsonArray locations = doc["locations"].to<JsonArray>();
+        if (g_locationSet) {
+            JsonObject current = locations.add<JsonObject>();
+            current["name"] = g_locName.length() ? g_locName : String("Current location");
+            current["lat"] = g_settings.homeLat; current["lon"] = g_settings.homeLon;
+        }
+        char names[RECENTS_MAX][40]; double lats[RECENTS_MAX], lons[RECENTS_MAX];
+        const int n = host_recents_get(names, lats, lons, RECENTS_MAX);
+        for (int i = 0; i < n; ++i) {
+            if (!std::isfinite(lats[i]) || !std::isfinite(lons[i]) || lats[i] < -90 || lats[i] >= 90 || lons[i] < -180 || lons[i] >= 180) continue;
+            bool duplicate = false;
+            for (JsonObjectConst item : locations)
+                if (fabs(item["lat"].as<double>()-lats[i]) < .00001 && fabs(item["lon"].as<double>()-lons[i]) < .00001) duplicate = true;
+            if (duplicate) continue;
+            JsonObject item = locations.add<JsonObject>();
+            item["name"] = names[i]; item["lat"] = lats[i]; item["lon"] = lons[i];
+        }
+        String body; serializeJson(doc, body); g_web.send(200, "application/json", body);
+    });
     g_web.on("/roads.json", [] {
         JsonDocument doc;
         doc["status"] = roads_download::status();
@@ -3527,6 +3554,23 @@ void setup() {
         doc["http"] = roads_download::httpStatus();
         doc["responseLength"] = roads_download::responseLength();
         doc["endpoint"] = ROAD_OVERPASS_URL;
+        doc["tile"] = roads_download::tile();
+        doc["roadClass"] = roads_download::roadClass();
+        doc["bytesRead"] = roads_download::bytesRead();
+        doc["jsonPeak"] = roads_download::jsonPeak();
+        doc["elapsedMs"] = roads_download::elapsedMs();
+        doc["firstSectionMs"] = roads_download::firstSectionMs();
+        doc["headersMs"] = roads_download::headersMs();
+        doc["downloadMs"] = roads_download::downloadMs();
+        doc["transportMs"] = roads_download::transportMs();
+        doc["idleMs"] = roads_download::idleMs();
+        doc["processingMs"] = roads_download::processingMs();
+        doc["queueWaitMs"] = roads_download::queueWaitMs();
+        doc["readCalls"] = roads_download::readCalls();
+        doc["emptyPolls"] = roads_download::emptyPolls();
+        doc["roadsReceived"] = roads_download::roadsReceived();
+        doc["areasSaved"] = roads_download::completedAreas();
+        doc["areasTotal"] = roads_download::totalAreas();
         doc["revision"] = roads_sd::revision();
         String body; serializeJson(doc, body);
         g_web.send(200, "application/json", body);
@@ -3706,9 +3750,18 @@ void loop() {
     // ever touched from this task. The update panel is up throughout, so the frames this
     // costs are frames of a screen nobody is looking at.
     if (theme_pull::active()) theme_pull::step();
+    road_preload::step(theme_pull::active() || orb_link::transferActive() || (bool)g_sdUpFile);
     roads_download::step(g_settings.homeLat, g_settings.homeLon, g_settings.rangeKm,
                          g_locationSet && theme_style::radar().mapRoadsOn,
                          theme_pull::active() || orb_link::transferActive() || (bool)g_sdUpFile);
+    static uint32_t roadStatusAt = 0;
+    if ((int32_t)(millis() - roadStatusAt) >= 0) {
+        roadStatusAt = millis() + 1000;
+        char message[112] = {};
+        if (g_locationSet && theme_style::radar().mapRoadsOn)
+            roads_download::progressText(message, sizeof(message));
+        radar::setRoadStatus(message);
+    }
     static unsigned lastRoadRevision = 0;
     if (lastRoadRevision != roads_sd::revision()) {
         lastRoadRevision = roads_sd::revision();

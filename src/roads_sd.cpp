@@ -1,4 +1,5 @@
 #include "roads_sd.h"
+#include "road_tile_plan.h"
 #include "coastline.h"   // geo_project_polylines_flat() — the shared projection/clip math
 #include <math.h>
 #include <string.h>
@@ -125,6 +126,7 @@ bool th_open(const char *path, TileFile &h) {
     return (bool)h.f;
 }
 int  th_read(TileFile &h, uint8_t *dst, size_t n) { return h.f.read(dst, n); }
+size_t th_size(TileFile &h) { return h.f.size(); }
 void th_close(TileFile &h) { h.f.close(); }
 #else
 std::string s_simRoot;
@@ -135,6 +137,11 @@ bool th_open(const char *path, TileFile &h) {
     return h.f != nullptr;
 }
 int  th_read(TileFile &h, uint8_t *dst, size_t n) { return (int)fread(dst, 1, n, h.f); }
+size_t th_size(TileFile &h) {
+    const long pos = ftell(h.f);
+    fseek(h.f, 0, SEEK_END); const long size = ftell(h.f); fseek(h.f, pos, SEEK_SET);
+    return size < 0 ? 0 : (size_t)size;
+}
 void th_close(TileFile &h) { if (h.f) fclose(h.f); }
 #endif
 
@@ -154,6 +161,14 @@ bool read_exact(TileFile &h, uint8_t *dst, size_t n) {
     }
     g_ioMs += millis() - t0;
     return true;
+}
+
+bool valid_header(TileFile &h, const uint8_t *header) {
+    const unsigned polys = header[0] | (header[1] << 8);
+    const uint32_t points = header[2] | ((uint32_t)header[3] << 8) |
+                            ((uint32_t)header[4] << 16) | ((uint32_t)header[5] << 24);
+    return polys <= MAX_TILE_POLYS && points <= 2*1024*1024 && points >= polys*2 &&
+           th_size(h) == 6 + polys*2 + points*4;
 }
 
 } // namespace
@@ -192,7 +207,7 @@ static void stream_tile(const char *path, double homeLat, double homeLon,
     ++g_tilesOpened;
 
     uint8_t hdr[6];
-    if (!read_exact(h, hdr, 6)) { th_close(h); return; }
+    if (!read_exact(h, hdr, 6) || !valid_header(h, hdr)) { th_close(h); return; }
     uint16_t numPolys; memcpy(&numPolys, hdr, 2);
     uint32_t numPts;   memcpy(&numPts, hdr + 2, 4);
     if (numPolys == 0 || numPolys > MAX_TILE_POLYS) { th_close(h); return; }
@@ -237,6 +252,8 @@ static void walk_tiles(double homeLat, double homeLon, double rangeKm,
     const long latFloor = tile_floor(homeLat, ROAD_TILE_GRID_DEG);
     const long lonFloor = tile_floor(homeLon, ROAD_TILE_GRID_DEG);
     g_tilesOpened = 0;
+    bool legacy[3][3] = {};
+    bool fullClass[3][3][2] = {};
     for (int dy = -1; dy <= 1; ++dy) {
         for (int dx = -1; dx <= 1; ++dx) {
             if (out.numPts >= out.maxPts || out.numPolys >= out.maxPolys) return;  // full
@@ -244,8 +261,42 @@ static void walk_tiles(double homeLat, double homeLon, double rangeKm,
             snprintf(path, sizeof(path), "/roads/r%ld_%ld.bin",
                     latFloor + dy * (long)ROAD_TILE_GRID_DEG,
                     lonFloor + dx * (long)ROAD_TILE_GRID_DEG);
+            TileFile old;
+            if (th_open(path, old)) {
+                uint8_t header[6];
+                legacy[dy+1][dx+1] = read_exact(old, header, sizeof(header)) && valid_header(old, header);
+                th_close(old);
+            }
+            if (legacy[dy+1][dx+1]) stream_tile(path, homeLat, homeLon, rangeKm, cx, cy, rOuterPx, out);
+            else for (unsigned roadClass = 0; roadClass < 2; ++roadClass) {
+                road_tile_plan::path(path, sizeof(path), (latFloor+dy)*4, (lonFloor+dx)*4, roadClass, 4);
+                TileFile complete;
+                if (th_open(path, complete)) {
+                    uint8_t header[6];
+                    fullClass[dy+1][dx+1][roadClass] = read_exact(complete, header, sizeof(header)) && valid_header(complete, header);
+                    th_close(complete);
+                }
+                if (fullClass[dy+1][dx+1][roadClass]) stream_tile(path, homeLat, homeLon, rangeKm, cx, cy, rOuterPx, out);
+            }
+        }
+    }
+    const double cosLat = fmax(0.15, cos(homeLat * 3.141592653589793 / 180.0));
+    for (int y = (latFloor-1)*4; y < (latFloor+2)*4; ++y) {
+      for (int x = (lonFloor-1)*4; x < (lonFloor+2)*4; ++x) {
+        if (y < -360 || y >= 360 || x < -720 || x >= 720) continue;
+        const int dy = road_tile_plan::degree(y) - latFloor + 1;
+        const int dx = road_tile_plan::degree(x) - lonFloor + 1;
+        if (legacy[dy][dx]) continue; // don't paint old and new coverage twice
+        const double gapY = fmax(fmax(y/4.0-homeLat, 0.0), homeLat-y/4.0-0.25)*111.0;
+        const double gapX = fmax(fmax(x/4.0-homeLon, 0.0), homeLon-x/4.0-0.25)*111.0*cosLat;
+        if (gapY*gapY + gapX*gapX > rangeKm*rangeKm) continue;
+        for (unsigned roadClass = 0; roadClass < 2; ++roadClass) {
+            if (fullClass[dy][dx][roadClass]) continue;
+            if (out.numPts >= out.maxPts || out.numPolys >= out.maxPolys) return;
+            char path[48]; road_tile_plan::path(path, sizeof(path), y, x, roadClass);
             stream_tile(path, homeLat, homeLon, rangeKm, cx, cy, rOuterPx, out);
         }
+      }
     }
 }
 
