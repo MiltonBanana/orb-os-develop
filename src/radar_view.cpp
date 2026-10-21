@@ -2508,6 +2508,9 @@ void refreshCustomStyle() {
     // reads the finished state rather than trying to predict it, and it hides only
     // what it has actually absorbed, so a failure here degrades to the live stack
     // rather than to a missing layer.
+    // The snapshot contains the theme's map switches, colours, widths and exclusion
+    // zones. Refresh it too, even when home/range (and thus the vectors) did not move.
+    take_map_snapshot();
     rebuild_flat_background();
     apply_grid_visibility();
     applyRadarLayerOrder();
@@ -2524,8 +2527,11 @@ void update(const std::vector<Aircraft> &aircraft, const RadarSettings &s) {
     // Reproject the coastline only when the scope geometry actually changes (home
     // moved or range zoomed) — never per frame. Then repaint the static chrome layer.
     static double s_coLat = 1e9, s_coLon = 1e9; static float s_coRange = -1.0f;
-    if (s.homeLat != s_coLat || s.homeLon != s_coLon || s.rangeKm != s_coRange) {
+    static unsigned s_roadRevision = 0;
+    const bool geometryChanged = s.homeLat != s_coLat || s.homeLon != s_coLon || s.rangeKm != s_coRange;
+    if (geometryChanged || s_roadRevision != roads_sd::revision()) {
         const bool firstFix = (s_coRange < 0.0f);
+        s_roadRevision = roads_sd::revision();
         s_coLat = s.homeLat; s_coLon = s.homeLon; s_coRange = s.rangeKm;
         coastline_project(s.homeLat, s.homeLon, s.rangeKm, s_cx, s_cy, R);
         airports_project(s.homeLat, s.homeLon, s.rangeKm, s_cx, s_cy, R);
@@ -2540,7 +2546,7 @@ void update(const std::vector<Aircraft> &aircraft, const RadarSettings &s) {
             rebuild_flat_background();
             apply_grid_visibility();
         }
-        if (!firstFix) {
+        if (!firstFix && geometryChanged) {
             // Scope scale/center changed: old trails were plotted at the previous
             // projection and would be wrong now — drop them and clear the flow layer.
             s_trails.clear();

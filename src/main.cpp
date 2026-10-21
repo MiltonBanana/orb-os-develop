@@ -52,6 +52,7 @@
 #include "diag_log.h"                // RTC-memory event ring buffer, survives a reboot
 #include "sdcard.h"                  // microSD (TF) slot, SPI mode
 #include "roads_sd.h"                // worldwide roads read off the SD card
+#include "roads_download.h"
 #include "clock_view.h"              // clock app (app two)
 #include "weather_view.h"           // animated weather-radar app (knob channel)
 #include "settings_view.h"          // settings app (menu; captures the knob)
@@ -3519,6 +3520,17 @@ void setup() {
         g_web.send(200, "application/json", b);
     });
     g_web.on("/sdput", HTTP_POST, handleSdPutDone, handleSdPutUpload);   // Launch Kit pushes theme files here
+    g_web.on("/roads.json", [] {
+        JsonDocument doc;
+        doc["status"] = roads_download::status();
+        doc["error"] = roads_download::lastError();
+        doc["http"] = roads_download::httpStatus();
+        doc["responseLength"] = roads_download::responseLength();
+        doc["endpoint"] = ROAD_OVERPASS_URL;
+        doc["revision"] = roads_sd::revision();
+        String body; serializeJson(doc, body);
+        g_web.send(200, "application/json", body);
+    });
     // "I am done sending." Without it the install overlay has no way to tell the end of a
     // transfer from the death of one — see update_ui::installed().
     g_web.on("/installed", HTTP_POST, []{
@@ -3694,6 +3706,14 @@ void loop() {
     // ever touched from this task. The update panel is up throughout, so the frames this
     // costs are frames of a screen nobody is looking at.
     if (theme_pull::active()) theme_pull::step();
+    roads_download::step(g_settings.homeLat, g_settings.homeLon, g_settings.rangeKm,
+                         g_locationSet && theme_style::radar().mapRoadsOn,
+                         theme_pull::active() || orb_link::transferActive() || (bool)g_sdUpFile);
+    static unsigned lastRoadRevision = 0;
+    if (lastRoadRevision != roads_sd::revision()) {
+        lastRoadRevision = roads_sd::revision();
+        if (g_radarViewActive) radar::update(g_snap, g_settings);
+    }
     serial_wifi_join_tick();   // a join asked for over the cable; a no-op otherwise
 
     // THE FORCED RE-BAKE IS NOT DONE HERE, and the first version of it was.

@@ -139,6 +139,7 @@ void th_close(TileFile &h) { if (h.f) fclose(h.f); }
 #endif
 
 uint32_t g_ioMs = 0, g_projMs = 0;   // split of where a projection's time actually goes
+unsigned g_tilesOpened = 0;
 
 bool read_exact(TileFile &h, uint8_t *dst, size_t n) {
     static uint8_t chunk[4096];   // internal RAM (DMA-safe); single-task use
@@ -158,6 +159,10 @@ bool read_exact(TileFile &h, uint8_t *dst, size_t n) {
 } // namespace
 
 namespace roads_sd {
+
+static unsigned s_revision = 0;
+unsigned revision() { return s_revision; }
+void tiles_changed() { ++s_revision; }
 
 #ifndef ARDUINO
 void set_root(const char *root) { s_simRoot = root; }
@@ -184,6 +189,7 @@ static void stream_tile(const char *path, double homeLat, double homeLon,
                         double rangeKm, float cx, float cy, float rOuterPx, Sink &out) {
     TileFile h;
     if (!th_open(path, h)) return;
+    ++g_tilesOpened;
 
     uint8_t hdr[6];
     if (!read_exact(h, hdr, 6)) { th_close(h); return; }
@@ -230,6 +236,7 @@ static void walk_tiles(double homeLat, double homeLon, double rangeKm,
                        float cx, float cy, float rOuterPx, Sink &out) {
     const long latFloor = tile_floor(homeLat, ROAD_TILE_GRID_DEG);
     const long lonFloor = tile_floor(homeLon, ROAD_TILE_GRID_DEG);
+    g_tilesOpened = 0;
     for (int dy = -1; dy <= 1; ++dy) {
         for (int dx = -1; dx <= 1; ++dx) {
             if (out.numPts >= out.maxPts || out.numPolys >= out.maxPolys) return;  // full
@@ -254,6 +261,14 @@ void project(double homeLat, double homeLon, double rangeKm,
     unlock();
     s_numPts   = out.numPts;
     s_numPolys = out.numPolys;
+#ifdef ARDUINO
+    Serial.printf("[roads_sd] flight: %u tile(s) opened, %u visible polylines\n",
+                  g_tilesOpened, (unsigned)s_numPolys);
+    if (!g_tilesOpened)
+        Serial.printf("[roads_sd] no map tiles opened: check SD card and /roads/r%ld_%ld.bin plus neighbours\n",
+                      tile_floor(homeLat, ROAD_TILE_GRID_DEG),
+                      tile_floor(homeLon, ROAD_TILE_GRID_DEG));
+#endif
 }
 
 // The same worldwide roads, projected into buffers the CALLER owns, for a screen with its
